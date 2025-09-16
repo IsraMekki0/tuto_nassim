@@ -1254,7 +1254,6 @@ def create_interactive_temporal_plot(images, tile_ids, wavelengths, rgb_indices,
     """Create interactive temporal visualization with clickable first image."""
     from functools import partial
     import math
-    from helpers.utils import clip_and_scale, insert_gaps_for_discontinuities
 
     n = len(images)
     ncols = min(5, n)
