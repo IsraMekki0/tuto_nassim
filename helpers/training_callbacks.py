@@ -11,6 +11,10 @@ import matplotlib.pyplot as plt
 from lightning import Callback
 from IPython.display import display, clear_output
 from typing import Dict, List, Optional, Any
+from lightly.models import utils as L
+
+
+from utils import denormalize_tensor, create_mae_reconstruction_plot
 
 
 class SegmentationTrainingMonitor(Callback):
@@ -322,3 +326,144 @@ def compute_micro_iou(predictions: torch.Tensor, targets: torch.Tensor,
         total_union += union
     
     return total_intersection / total_union if total_union > 0 else float('nan')
+
+class MAEVisAndLossCallback(Callback):
+    """Callback for MAE training visualization with live loss tracking."""
+
+    def __init__(
+        self,
+        every_n_steps_images: int = 500,
+        loss_every_n_steps: int = 50,
+        rgb_indices=(60, 30, 10),
+    ) -> None:
+        super().__init__()
+        self.every_n_steps_images = every_n_steps_images
+        self.loss_every_n_steps = loss_every_n_steps
+        self.rgb_indices = rgb_indices
+        self.steps = []
+        self.losses = []
+        self._imgs = None
+
+    @torch.no_grad()
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        step = trainer.global_step
+
+        # Record loss
+        loss_val = self._extract_loss(outputs, trainer)
+        if loss_val is not None:
+            self.steps.append(step)
+            self.losses.append(loss_val)
+
+        # Update images occasionally
+        update_imgs = (self._imgs is None) or (step % self.every_n_steps_images == 0)
+        if update_imgs:
+            self._imgs = self._generate_reconstruction_images(pl_module, batch)
+
+        # Draw visualization
+        should_draw = update_imgs or (step % self.loss_every_n_steps == 0)
+        if should_draw:
+            self._draw_visualization(pl_module, step)
+
+    def _extract_loss(self, outputs, trainer):
+        """Extract loss value from various possible sources."""
+        if isinstance(outputs, torch.Tensor):
+            return float(outputs.detach().cpu().item())
+        elif isinstance(outputs, dict) and "loss" in outputs:
+            return float(outputs["loss"].detach().cpu().item())
+
+        # Try from logged metrics
+        for key in ("train_loss", "loss", "train_loss_step", "train/loss"):
+            if key in trainer.callback_metrics:
+                v = trainer.callback_metrics[key]
+                try:
+                    return float(v.detach().cpu().item() if torch.is_tensor(v) else float(v))
+                except Exception:
+                    continue
+        return None
+
+    def _generate_reconstruction_images(self, pl_module, batch):
+        """Generate reconstruction images for visualization."""
+        device = pl_module.device
+        mean = pl_module.mean.to(device).float()
+        std = pl_module.std.to(device).float()
+        ps = pl_module.patch_size
+
+        # Prepare input
+        img = batch["image"][0:1].to(device).float()  # (1,C,H,W)
+        B, C, H, W = img.shape
+        img_norm = (img - mean.view(1, -1, 1, 1)) / std.view(1, -1, 1, 1)
+
+        # Generate mask and reconstruct
+        L_seq = pl_module.sequence_length
+        idx_keep, idx_mask = L.random_token_mask(
+            size=(B, L_seq), mask_ratio=pl_module.mask_ratio, device=device
+        )
+
+        x_encoded = pl_module.forward_encoder(images=img_norm, idx_keep=idx_keep)
+        x_pred = pl_module.forward_decoder(x_encoded=x_encoded, idx_keep=idx_keep, idx_mask=idx_mask)
+
+        # Reconstruct full image
+        patches = L.patchify(img_norm, ps)
+        if pl_module.norm_pix:
+            target_masked = L.get_at_index(patches, idx_mask - 1)
+            mean_patch = target_masked.mean(dim=-1, keepdim=True)
+            var_patch = target_masked.var(dim=-1, keepdim=True)
+            x_pred_denorm = x_pred * (var_patch + 1e-6).sqrt() + mean_patch
+        else:
+            x_pred_denorm = x_pred
+
+        recon_patches = L.set_at_index(patches, idx_mask - 1, x_pred_denorm)
+        recon_norm = L.unpatchify(recon_patches, ps, channels=C)
+        recon = denormalize_tensor(recon_norm, mean, std).squeeze(0)
+        original = img.squeeze(0)
+
+        # Create masked version for display
+        masked = original.clone()
+        Wp = W // ps
+        for m in (idx_mask[0] - 1).detach().cpu().long().tolist():
+            r, c = int(m // Wp), int(m % Wp)
+            r0, r1 = r * ps, (r + 1) * ps
+            c0, c1 = c * ps, (c + 1) * ps
+            masked[:, r0:r1, c0:c1] = 0.0
+
+        return original, masked, recon
+
+    def _draw_visualization(self, pl_module, step):
+        """Draw the complete visualization with images and loss."""
+        clear_output(wait=True)
+        fig = plt.figure(figsize=(14, 4.5), dpi=120)
+
+        # Images
+        if self._imgs is not None:
+            original, masked, recon = self._imgs
+            recon_fig = create_mae_reconstruction_plot(
+                original, masked, recon, self.rgb_indices,
+                pl_module.mask_ratio, step, figsize=(9, 4)
+            )
+
+            # Copy subplots to main figure
+            recon_axes = recon_fig.get_axes()
+            for i, recon_ax in enumerate(recon_axes):
+                ax = fig.add_subplot(1, 4, i+1)
+                img = recon_ax.get_images()[0].get_array()
+                ax.imshow(img)
+                ax.set_title(recon_ax.get_title())
+                ax.axis("off")
+            plt.close(recon_fig)
+
+        # Loss plot
+        ax4 = fig.add_subplot(1, 4, 4)
+        if len(self.steps) > 0:
+            ax4.plot(self.steps, self.losses)
+            ax4.set_title("Training Loss")
+            ax4.set_xlabel("Step")
+            ax4.set_ylabel("MSE")
+            ax4.grid(True, alpha=0.3)
+        else:
+            ax4.text(0.5, 0.5, "No loss data yet", ha="center", va="center")
+            ax4.axis("off")
+
+        fig.suptitle("MAE Training Progress", y=1.02)
+        plt.tight_layout()
+        display(fig)
+        plt.close(fig)
