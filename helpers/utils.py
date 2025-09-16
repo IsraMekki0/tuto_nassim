@@ -1342,3 +1342,247 @@ SPECTRAL_WINDOWS = [
     ("NIR 800–880", 800, 880),
     ("SWIR1 1600–1700", 1600, 1700),
 ]
+
+# =============================================================================
+# Cluster Visualization Utility
+# =============================================================================
+
+def visualize_clusters(
+    embeddings_2d,
+    cluster_centers_2d,
+    n_clusters,
+    cluster_labels,
+    sample_images,
+    rgb_indices,
+    samples_per_cluster=5,  # Number of samples to show per cluster
+    clusters_to_show=None,
+    max_clusters_to_display=5,  # Maximum clusters to show in auto-mode
+):
+    # Determine which clusters to visualize
+    if clusters_to_show is None:
+        # Auto-select clusters randomly (for exploration)
+        available_clusters = list(range(n_clusters))
+        for cluster_id in range(n_clusters):
+            cluster_mask = cluster_labels == cluster_id
+
+        # Randomly select clusters for variety
+        np.random.shuffle(available_clusters)
+        selected_clusters = available_clusters[:max_clusters_to_display]
+
+        print(
+            f"  Randomly selected {len(selected_clusters)} clusters: {selected_clusters}"
+        )
+    else:
+        # Use user-specified clusters
+        selected_clusters = [c for c in clusters_to_show if c < n_clusters]
+        print(f"  User-selected clusters: {selected_clusters}")
+
+    n_display_clusters = len(selected_clusters)
+
+    # Find multiple representative samples from selected clusters
+    print(
+        f"  Finding {samples_per_cluster} samples from {n_display_clusters} clusters..."
+    )
+    cluster_samples = {}
+
+    for cluster_id in selected_clusters:
+        cluster_mask = cluster_labels == cluster_id
+        cluster_points = embeddings_2d[cluster_mask]
+        cluster_indices = np.where(cluster_mask)[0]
+
+        if len(cluster_points) > 0:
+            center = cluster_centers_2d[cluster_id]
+            distances = np.linalg.norm(cluster_points - center, axis=1)
+
+            # Get multiple samples: closest, some diverse ones
+            n_samples = min(samples_per_cluster, len(cluster_points))
+
+            if n_samples == 1:
+                selected_indices = [np.argmin(distances)]
+            else:
+                # Get closest sample
+                closest_idx = np.argmin(distances)
+                selected_local = [closest_idx]
+
+                # Get some diverse samples (spread across the cluster)
+                remaining_indices = list(range(len(cluster_points)))
+                remaining_indices.remove(closest_idx)
+
+                # Sort remaining by distance and pick evenly spread samples
+                remaining_distances = distances[remaining_indices]
+                sorted_remaining = np.argsort(remaining_distances)
+
+                # Select samples spread across the distance range
+                step = max(1, len(sorted_remaining) // (n_samples - 1))
+                for j in range(n_samples - 1):
+                    if j * step < len(sorted_remaining):
+                        selected_local.append(
+                            remaining_indices[sorted_remaining[j * step]]
+                        )
+
+            # Convert to global indices
+            selected_global = [cluster_indices[idx] for idx in selected_local]
+
+            cluster_samples[cluster_id] = {
+                "indices": selected_global[:n_samples],
+                "size": len(cluster_points),
+                "center": center,
+                "percentage": len(cluster_points) / len(embeddings_2d) * 100,
+            }
+
+    # Create the visualization
+    fig = plt.figure(figsize=(4 * n_display_clusters, 8 + 3 * samples_per_cluster))
+
+    # Main t-SNE plot with all clusters (but highlight selected ones)
+    ax_main = plt.subplot2grid(
+        (1 + samples_per_cluster, n_display_clusters),
+        (0, 0),
+        colspan=n_display_clusters,
+        rowspan=1,
+    )
+
+    # Color palette for all clusters
+    colors = plt.cm.Set3(np.linspace(0, 1, n_clusters))
+
+    # Plot all clusters (with different alpha for non-selected)
+    for cluster_id in range(n_clusters):
+        cluster_mask = cluster_labels == cluster_id
+        cluster_size = np.sum(cluster_mask)
+        cluster_pct = cluster_size / len(embeddings_2d) * 100
+
+        # Different style for selected vs non-selected clusters
+        if cluster_id in selected_clusters:
+            alpha, size, label = (
+                0.8,
+                60,
+                f"Cluster {cluster_id} ({cluster_size} samples, {cluster_pct:.1f}%)",
+            )
+            edgecolor, linewidth = "black", 0.8
+
+        scatter = ax_main.scatter(
+            embeddings_2d[cluster_mask, 0],
+            embeddings_2d[cluster_mask, 1],
+            c=[colors[cluster_id]],
+            label=label,
+            alpha=alpha,
+            s=size,
+            edgecolors=edgecolor,
+            linewidths=linewidth,
+        )
+
+        # Mark cluster centers (only for selected clusters)
+        if cluster_id in selected_clusters:
+            center = cluster_centers_2d[cluster_id]
+            ax_main.scatter(
+                center[0],
+                center[1],
+                c="red",
+                s=200,
+                marker="X",
+                edgecolors="black",
+                linewidths=2,
+                alpha=0.9,
+                zorder=10,
+            )
+
+    if n_display_clusters == n_clusters:
+        title_suffix = f"All {n_clusters} clusters"
+    else:
+        title_suffix = (
+            f"{n_display_clusters}/{n_clusters} clusters (random selection)"
+        )
+
+    ax_main.set_title(
+        "t-SNE Embeddings: DINO Learned Clusters\n"
+        + f"Hyperspectral Data ({len(embeddings_2d)} samples, {title_suffix})",
+        fontsize=16,
+    )
+    ax_main.set_xlabel("t-SNE Dimension 1")
+    ax_main.set_ylabel("t-SNE Dimension 2")
+    ax_main.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=9)
+    ax_main.grid(True, alpha=0.3)
+
+    # Show multiple samples from selected clusters only
+    print(
+        f"  Displaying {samples_per_cluster} samples from {n_display_clusters} selected clusters..."
+    )
+
+    for sample_row in range(samples_per_cluster):
+        for col_idx, cluster_id in enumerate(selected_clusters):
+            ax_img = plt.subplot2grid(
+                (1 + samples_per_cluster, n_display_clusters),
+                (1 + sample_row, col_idx),
+            )
+
+            # Get the sample for this row
+            if cluster_id in cluster_samples:
+                sample_indices = cluster_samples[cluster_id]["indices"]
+
+                if sample_row < len(sample_indices):
+                    sample_idx = sample_indices[sample_row]
+
+                    # Get the corresponding image
+                    if sample_idx < len(sample_images):
+                        sample_image = sample_images[sample_idx]
+                    else:
+                        sample_image = sample_images[0]  # Fallback
+
+                    # Create RGB composite
+                    if len(sample_image.shape) == 3:  # (C, H, W)
+                        rgb_image = (
+                            sample_image[list(rgb_indices)]
+                            .numpy()
+                            .transpose(1, 2, 0)
+                        )
+                    else:
+                        rgb_image = sample_image.numpy()
+
+                    # Apply percentile scaling
+                    p2, p98 = np.percentile(rgb_image, [2, 98])
+                    rgb_image = np.clip(
+                        (rgb_image - p2) / (p98 - p2 + 1e-8), 0, 1
+                    )
+
+                    ax_img.imshow(rgb_image)
+
+                    # Add title only to the first row
+                    if sample_row == 0:
+                        cluster_size = cluster_samples[cluster_id]["size"]
+                        cluster_pct = cluster_samples[cluster_id]["percentage"]
+                        ax_img.set_title(
+                            f"Cluster {cluster_id}\n{cluster_size} samples ({cluster_pct:.1f}%)",
+                            fontsize=12,
+                            color=colors[cluster_id],
+                            weight="bold",
+                        )
+
+                    # Add sample number as text overlay
+                    ax_img.text(
+                        5,
+                        15,
+                        f"#{sample_row + 1}",
+                        color="white",
+                        fontweight="bold",
+                        bbox=dict(
+                            boxstyle="round,pad=0.3",
+                            facecolor="black",
+                            alpha=0.7,
+                        ),
+                    )
+                else:
+                    # Empty subplot if no more samples
+                    ax_img.text(
+                        0.5,
+                        0.5,
+                        "No more\nsamples",
+                        ha="center",
+                        va="center",
+                        transform=ax_img.transAxes,
+                        fontsize=10,
+                        alpha=0.5,
+                    )
+
+            ax_img.axis("off")
+
+    plt.tight_layout()
+    plt.show()
